@@ -46,6 +46,9 @@ import java.util.regex.Pattern;
 import javax.mail.MessagingException;
 import javax.mail.internet.MimeMessage;
 
+import com.zimbra.common.soap.AdminConstants;
+import com.zimbra.common.soap.Element;
+import com.zimbra.common.util.*;
 import org.dom4j.DocumentException;
 
 import com.google.common.base.Charsets;
@@ -76,12 +79,6 @@ import com.zimbra.common.mailbox.ZimbraQueryHitResults;
 import com.zimbra.common.mailbox.ZimbraSearchParams;
 import com.zimbra.common.service.ServiceException;
 import com.zimbra.common.soap.SoapFaultException;
-import com.zimbra.common.util.AccessBoundedRegex;
-import com.zimbra.common.util.Constants;
-import com.zimbra.common.util.DateUtil;
-import com.zimbra.common.util.Pair;
-import com.zimbra.common.util.StringUtil;
-import com.zimbra.common.util.ZimbraLog;
 import com.zimbra.cs.account.Account;
 import com.zimbra.cs.account.AccountServiceException;
 import com.zimbra.cs.account.AuthToken;
@@ -989,6 +986,15 @@ public abstract class ImapHandler {
                 } else if (command.equals("X-ZIMBRA-RELOADLC")) {
                     checkEOF(tag, req);
                     return doRELOADLC(tag);
+                } else if (command.equals("X-ZIMBRA-ADD-ACCOUNT-LOGGER")) {
+                    req.skipSpace();
+                    String accountString = req.readAstring();
+                    req.skipSpace();
+                    String category = req.readAstring();
+                    req.skipSpace();
+                    String level = req.readAstring();
+                    checkEOF(tag, req);
+                    return doADDACCOUNTLOGGER(tag, accountString, category, level);
                 }
                 break;
             }
@@ -1483,6 +1489,67 @@ public abstract class ImapHandler {
                 authenticator.getMechanism().equals(ZimbraAuthenticator.MECHANISM) &&
                 ((ZimbraAuthenticator) authenticator).getAuthToken().isAdmin();
 
+    }
+
+    private boolean doADDACCOUNTLOGGER(String tag, String id, String category, String sLevel) throws IOException {
+        ZimbraLog.imap.info("Adding account level logger for '%s' category: %s level %s", id, category, sLevel);
+
+        if (!checkState(tag, State.AUTHENTICATED)) {
+            return true;
+        } else if (!checkZimbraAdminAuth()) {
+            sendNO(tag, "must be authenticated as admin with X-ZIMBRA auth mechanism");
+            return true;
+        }
+
+        try {
+            Account account = Provisioning.getInstance().get(AccountBy.name, id);
+            if (account == null || !account.isAccountStatusActive()) {
+                ZimbraLog.imap.warn("target account missing or not active; dropping connection");
+                sendNO(tag, "must specify an actual account");
+                return true;
+            }
+
+            // Handle level.
+            Log.Level level = null;
+            try {
+                level = Log.Level.valueOf(sLevel.toLowerCase());
+            } catch (IllegalArgumentException e) {
+                String error = String.format("Invalid level: %s.  Valid values are %s.",
+                        sLevel, StringUtil.join(",", Log.Level.values()));
+                ZimbraLog.imap.warn(error);
+                sendNO(tag, "FATAL: " + error);
+                return true;
+            }
+
+            // Handle category.
+            Collection<Log> loggers;
+            if (category.equalsIgnoreCase("all")) {
+                loggers = LogFactory.getAllLoggers();
+            } else {
+                if (!LogFactory.logExists(category)) {
+                    String message = "Log category " + category + " does not exist.";
+                    ZimbraLog.imap.error(message);
+                    sendNO(tag, "Error: " + message);
+                    return true;
+                }
+                loggers = Arrays.asList(LogFactory.getLog(category));
+            }
+
+            // Add custom loggers.
+            for (Log log : loggers) {
+                ZimbraLog.misc.debug("Adding custom logger: account=%s, category=%s, level=%s",
+                        id, category, level);
+                log.addAccountLogger(account.getName(), level);
+            }
+
+        } catch (ServiceException e) {
+            ZimbraLog.imap.warn("error checking target account status; dropping connection", e);
+            sendNO(tag, "must specify an actual account");
+            return false;
+        }
+
+        sendOK(tag, "ADDACCOUNTLOGGER completed");
+        return true;
     }
 
     private boolean doFLUSHCACHE(String tag, List<CacheEntryType> types, List<CacheEntrySelector> entries)
