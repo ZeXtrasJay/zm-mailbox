@@ -16,11 +16,13 @@
  */
 package com.zimbra.cs.service.admin;
 
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 
+import com.zimbra.common.localconfig.LC;
 import com.zimbra.common.service.ServiceException;
 import com.zimbra.common.soap.AdminConstants;
 import com.zimbra.common.soap.Element;
@@ -29,39 +31,38 @@ import com.zimbra.common.util.Log.Level;
 import com.zimbra.common.util.LogFactory;
 import com.zimbra.common.util.StringUtil;
 import com.zimbra.common.util.ZimbraLog;
-import com.zimbra.cs.account.Account;
-import com.zimbra.cs.account.AccountServiceException;
-import com.zimbra.cs.account.Provisioning;
+import com.zimbra.cs.account.*;
+import com.zimbra.cs.service.AuthProvider;
 import com.zimbra.common.account.Key.AccountBy;
-import com.zimbra.cs.account.Server;
 import com.zimbra.cs.account.accesscontrol.AdminRight;
 import com.zimbra.cs.account.accesscontrol.Rights.Admin;
+import com.zimbra.cs.mailclient.imap.ImapConnection;
 import com.zimbra.soap.ZimbraSoapContext;
 
 /**
  * Adds a custom logger for the given account.
- * 
+ *
  * @author bburtin
  */
 public class AddAccountLogger extends AdminDocumentHandler {
 
     static String CATEGORY_ALL = "all";
-    
+
     @Override
     public Element handle(Element request, Map<String, Object> context)
     throws ServiceException {
         ZimbraSoapContext zsc = getZimbraSoapContext(context);
-        
+
         Server localServer = Provisioning.getInstance().getLocalServer();
         checkRight(zsc, context, localServer, Admin.R_manageAccountLogger);
-        
+
         // Look up account
         Account account = getAccountFromLoggerRequest(request);
-        
+
         Element eLogger = request.getElement(AdminConstants.E_LOGGER);
         String category = eLogger.getAttribute(AdminConstants.A_CATEGORY);
         String sLevel = eLogger.getAttribute(AdminConstants.A_LEVEL);
-        
+
         // Handle level.
         Level level = null;
         try {
@@ -71,7 +72,7 @@ public class AddAccountLogger extends AdminDocumentHandler {
                 sLevel, StringUtil.join(",", Level.values()));
             throw ServiceException.INVALID_REQUEST(error, null);
         }
-        
+
         // Handle category.
         Collection<Log> loggers;
         if (category.equalsIgnoreCase(CATEGORY_ALL)) {
@@ -93,20 +94,55 @@ public class AddAccountLogger extends AdminDocumentHandler {
                 .addAttribute(AdminConstants.A_CATEGORY, log.getCategory())
                 .addAttribute(AdminConstants.A_LEVEL, level.name());
         }
-        
+
+        addAccountLoggerOnImapServers(account, category, sLevel);
+
         return response;
     }
-    
+
+    public static void addAccountLoggerOnImapServers(Account account, String category, String level) {
+        List<Server> imapServers;
+        try {
+            imapServers = Provisioning.getPreferredIMAPServers(account);
+        } catch (ServiceException e) {
+            ZimbraLog.imap.warn("unable to fetch list of imapd servers", e);
+            return;
+        }
+        for (Server server: imapServers) {
+            addAccountLoggerOnImapServer(server, account, category, level);
+        }
+    }
+
+    public static void addAccountLoggerOnImapServer(Server server, Account account, String category, String level)
+    {
+        ImapConnection connection = null;
+        try {
+            connection = ImapConnection.getZimbraConnection(server,  LC.zimbra_ldap_user.value(), AuthProvider.getAdminAuthToken());
+        } catch (ServiceException e) {
+            ZimbraLog.imap.warn("unable to connect to imapd server '%s' to issue X-ZIMBRA-ADD-ACCOUNT-LOGGER request", server.getServiceHostname(), e);
+            return;
+        }
+        try {
+            ZimbraLog.imap.debug("issuing X-ZIMBRA-ADD-ACCOUNT-LOGGER request to imapd server '%s' for account '%s'", server.getServiceHostname(), account.getName());
+            connection.addAccountLogger(account, category, level);
+        } catch (IOException e)
+        {
+            ZimbraLog.imap.warn("failed to enable account level logging for account '%s' on server '%s'", account.getName(), server.getServiceHostname(), e);
+        } finally {
+            connection.close();
+        }
+    }
+
     /**
      * Returns the <tt>Account</tt> object based on the &lt;id&gt; or &lt;account&gt;
-     * element owned by the given request element. 
+     * element owned by the given request element.
      */
     static Account getAccountFromLoggerRequest(Element request)
     throws ServiceException {
         Account account = null;
         Provisioning prov = Provisioning.getInstance();
         Element idElement = request.getOptionalElement(AdminConstants.E_ID);
-        
+
         if (idElement != null) {
             // Handle deprecated <id> element.
             ZimbraLog.soap.info("The <%s> element is deprecated for <%s>.  Use <%s> instead.",
@@ -127,7 +163,7 @@ public class AddAccountLogger extends AdminDocumentHandler {
         }
         return account;
     }
-    
+
     @Override
     public void docRights(List<AdminRight> relatedRights, List<String> notes) {
         relatedRights.add(Admin.R_manageAccountLogger);
